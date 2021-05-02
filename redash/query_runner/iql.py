@@ -1,156 +1,58 @@
+import logging
 import re
-from collections import OrderedDict
+from collections import defaultdict
 
 from redash.query_runner import *
 from redash.utils import json_dumps, json_loads
+from redash.utils.requests_session import requests
 
-
-# TODO: make this more general and move into __init__.py
-class ResultSet(object):
-    def __init__(self):
-        self.columns = OrderedDict()
-        self.rows = []
-
-    def add_row(self, row):
-        for key in row.keys():
-            self.add_column(key)
-
-        self.rows.append(row)
-
-    def add_column(self, column, column_type=TYPE_STRING):
-        if column not in self.columns:
-            self.columns[column] = {
-                "name": column,
-                "type": column_type,
-                "friendly_name": column,
-            }
-
-    def to_json(self):
-        return json_dumps({"rows": self.rows, "columns": list(self.columns.values())})
-
-    def merge(self, set):
-        self.rows = self.rows + set.rows
-
-
-def parse_issue(issue, field_mapping):
-    result = OrderedDict()
-    result["key"] = issue["key"]
-
-    for k, v in issue["fields"].items():  #
-        output_name = field_mapping.get_output_field_name(k)
-        member_names = field_mapping.get_dict_members(k)
-
-        if isinstance(v, dict):
-            if len(member_names) > 0:
-                # if field mapping with dict member mappings defined get value of each member
-                for member_name in member_names:
-                    if member_name in v:
-                        result[
-                            field_mapping.get_dict_output_field_name(k, member_name)
-                        ] = v[member_name]
-
-            else:
-                # these special mapping rules are kept for backwards compatibility
-                if "key" in v:
-                    result["{}_key".format(output_name)] = v["key"]
-                if "name" in v:
-                    result["{}_name".format(output_name)] = v["name"]
-
-                if k in v:
-                    result[output_name] = v[k]
-
-                if "watchCount" in v:
-                    result[output_name] = v["watchCount"]
-
-        elif isinstance(v, list):
-            if len(member_names) > 0:
-                # if field mapping with dict member mappings defined get value of each member
-                for member_name in member_names:
-                    listValues = []
-                    for listItem in v:
-                        if isinstance(listItem, dict):
-                            if member_name in listItem:
-                                listValues.append(listItem[member_name])
-                    if len(listValues) > 0:
-                        result[
-                            field_mapping.get_dict_output_field_name(k, member_name)
-                        ] = ",".join(listValues)
-
-            else:
-                # otherwise support list values only for non-dict items
-                listValues = []
-                for listItem in v:
-                    if not isinstance(listItem, dict):
-                        listValues.append(listItem)
-                if len(listValues) > 0:
-                    result[output_name] = ",".join(listValues)
-
-        else:
-            result[output_name] = v
-
-    return result
-
-
-def parse_issues(data, field_mapping):
-    results = ResultSet()
-
-    for issue in data["issues"]:
-        results.add_row(parse_issue(issue, field_mapping))
-
-    return results
-
-
-def parse_count(data):
-    results = ResultSet()
-    results.add_row({"count": data["total"]})
-    return results
-
-
-class FieldMapping:
-    def __init__(cls, query_field_mapping):
-        cls.mapping = []
-        for k, v in query_field_mapping.items():
-            field_name = k
-            member_name = None
-
-            # check for member name contained in field name
-            member_parser = re.search("(\w+)\.(\w+)", k)
-            if member_parser:
-                field_name = member_parser.group(1)
-                member_name = member_parser.group(2)
-
-            cls.mapping.append(
-                {
-                    "field_name": field_name,
-                    "member_name": member_name,
-                    "output_field_name": v,
-                }
-            )
-
-    def get_output_field_name(cls, field_name):
-        for item in cls.mapping:
-            if item["field_name"] == field_name and not item["member_name"]:
-                return item["output_field_name"]
-        return field_name
-
-    def get_dict_members(cls, field_name):
-        member_names = []
-        for item in cls.mapping:
-            if item["field_name"] == field_name and item["member_name"]:
-                member_names.append(item["member_name"])
-        return member_names
-
-    def get_dict_output_field_name(cls, field_name, member_name):
-        for item in cls.mapping:
-            if item["field_name"] == field_name and item["member_name"] == member_name:
-                return item["output_field_name"]
-        return None
-
-
+logger = logging.getLogger(__name__)
 IQL_BASE_URL = "https://app.impira.com"
 
+TYPES_MAP = {
+    'BOOL': TYPE_BOOLEAN,
+    'NUMBER': TYPE_INTEGER,
+    'STRING': TYPE_STRING,
+    'TIMESTAMP': TYPE_DATETIME,
+    'INFERRED_FLOAT': TYPE_FLOAT,
+    'INFERRED_STRING': TYPE_STRING,
+    'FT_DNE': TYPE_STRING,
+    None: TYPE_STRING,
+}
+
+class Field(object):
+    def __init__(self, path, iql_type, all_names):
+        self.path = path
+        self.iql_type = iql_type
+        self.name = '.'.join(['`' + x + '`' if ' ' in x else x for x in self.path])
+        if self.name in all_names:
+            all_names[self.name] += 1
+            self.name = '%s (%d)' (self.name, all_names[self.name])
+
+    def retrieve(self, data):
+        try:
+            curr = data
+            for p in self.path:
+                if not isinstance(curr, dict) or p not in curr:
+                    return None
+                curr = curr[p]
+            if self.iql_type == "NUMBER" and isinstance(curr, float):
+                self.iql_type = "INFERRED_FLOAT"
+
+            if self.iql_type == "INFERRED_STRING":
+                curr = json_dumps(curr)
+
+            return curr
+        except Exception:
+            logger.info("Field: %s", json_dumps(self.path))
+            logger.info("Data: %s", json_dumps(data))
+            raise
+
+    def type(self):
+        return TYPES_MAP[self.iql_type]
+
 class IQL(BaseQueryRunner):
-    noop_query = ""
+    noop_query = "@`__system::ecs` limit:0"
 
     @classmethod
     def name(cls):
@@ -174,44 +76,66 @@ class IQL(BaseQueryRunner):
         super(IQL, self).__init__(configuration)
         self.syntax = "json"
 
+    def get_base_url(self):
+        if self.configuration.get('base_url', None) is not None:
+            return self.configuration['base_url']
+        else:
+            return IQL_BASE_URL + '/o/' + requests.utils.quote(self.configuration['org']) + '/api/v2/iql'
+
+    def _flatten_schema(self, schema, path, all_names):
+        fields = []
+        for field in schema:
+            field_type = field.get('fieldType', None)
+            full_path = path + [field['name']]
+            if field_type in TYPES_MAP:
+                fields.append(Field(full_path, field_type, all_names))
+            elif field_type == 'ENTITY' and field['multiplicity'] == 'ONE_TO_MANY':
+                fields.append(Field(full_path, "INFERRED_STRING", all_names))
+            elif field_type == 'ENTITY':
+                try:
+                    fields.extend(self._flatten_schema(field.get('children', []), full_path, all_names))
+                except Exception:
+                    logger.info("FIELD: %s", json_dumps(field))
+                    logger.info("KEYS: %s", json_dumps([x for x in field.keys()]))
+                    raise
+            else:
+                raise Exception("Unknown field type %s: %s" % (field_type, json_dumps(field)))
+        return fields
+
+    def flatten_schema(self, schema):
+        all_names = defaultdict(lambda: 0)
+        return self._flatten_schema(schema, [], all_names)
+
+    def remove_comments(self, string):
+        return string[string.index("*/") + 2 :].strip().rstrip(";")
+
     def run_query(self, query, user):
-        jql_url = "{}/rest/api/2/search".format(self.configuration["url"])
+        base_url = self.get_base_url()
+        error = None
+        query = self.remove_comments(query)
+        logger.info("about to execute query (user='{}'): {}".format(user, query))
+        resp = requests.post(base_url, params={'token': self.configuration['api_key'], 'default_limit': 1000},
+                json={'query': query})
+        if not resp.ok:
+            return None, "Query failed (%d): %s" % (resp.status_code, resp.content)
 
-        query = json_loads(query)
-        query_type = query.pop("queryType", "select")
-        field_mapping = FieldMapping(query.pop("fieldMapping", {}))
+        data = resp.json()
+        fields = self.flatten_schema(data['schema']['children'])
 
-        if query_type == "count":
-            query["maxResults"] = 1
-            query["fields"] = ""
-        else:
-            query["maxResults"] = query.get("maxResults", 1000)
+        rows = []
+        for row in data['data']:
+            flattened = {}
+            for field in fields:
+                flattened[field.name] = field.retrieve(row)
+            rows.append(flattened)
 
-        response, error = self.get_response(jql_url, params=query)
-        if error is not None:
-            return None, error
+        columns = []
+        for field in fields:
+            columns.append(
+                {'name': field.name, 'friendly_name': field.name, 'type': field.type()}
+            )
 
-        data = response.json()
-
-        if query_type == "count":
-            results = parse_count(data)
-        else:
-            results = parse_issues(data, field_mapping)
-            index = data["startAt"] + data["maxResults"]
-
-            while data["total"] > index:
-                query["startAt"] = index
-                response, error = self.get_response(jql_url, params=query)
-                if error is not None:
-                    return None, error
-
-                data = response.json()
-                index = data["startAt"] + data["maxResults"]
-
-                addl_results = parse_issues(data, field_mapping)
-                results.merge(addl_results)
-
-        return results.to_json(), None
+        return json_dumps({'columns': columns, 'rows': rows}), None
 
 
 register(IQL)
