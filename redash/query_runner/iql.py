@@ -1,6 +1,7 @@
+from collections import defaultdict
 import logging
 import re
-from collections import defaultdict
+import concurrent.futures
 
 from redash.query_runner import *
 from redash.utils import json_dumps, json_loads
@@ -51,6 +52,20 @@ class Field(object):
     def type(self):
         return TYPES_MAP[self.iql_type]
 
+def parse_comment(comment_string):
+    return [x.strip() for x in comment_string.strip().lstrip('/*').rstrip('*/').split(',')]
+
+def execute_iql_query(base_url, user, params, query):
+    logger.info("about to execute  query (user='{}', params={}): {}".format(user, json_dumps(params), query))
+
+    resp = requests.post(base_url, params=params, json={'query': query})
+    if not resp.ok:
+        return None, "Query failed (%d): %s" % (resp.status_code, resp.content)
+
+    logger.info("finished executing query (user='{}', params={}): {}".format(user, json_dumps(params), query))
+
+    return resp.json()
+
 class IQL(BaseQueryRunner):
     noop_query = "@`__system::ecs` limit:0"
 
@@ -95,8 +110,8 @@ class IQL(BaseQueryRunner):
                 try:
                     fields.extend(self._flatten_schema(field.get('children', []), full_path, all_names))
                 except Exception:
-                    logger.info("FIELD: %s", json_dumps(field))
-                    logger.info("KEYS: %s", json_dumps([x for x in field.keys()]))
+                    logger.info("Field: %s", json_dumps(field))
+                    logger.info("Keys: %s", json_dumps([x for x in field.keys()]))
                     raise
             else:
                 raise Exception("Unknown field type %s: %s" % (field_type, json_dumps(field)))
@@ -104,23 +119,53 @@ class IQL(BaseQueryRunner):
 
     def flatten_schema(self, schema):
         all_names = defaultdict(lambda: 0)
-        return self._flatten_schema(schema, [], all_names)
+        return self._flatten_schema(schema.get('children', []), [], all_names)
 
-    def remove_comments(self, string):
-        return string[string.index("*/") + 2 :].strip().rstrip(";")
+    @property
+    def supports_auto_limit(self):
+        return True
+
+    def apply_auto_limit(self, query_text, should_apply_auto_limit):
+        if should_apply_auto_limit:
+            comment = '/* Limit: 1000 */'
+            return comment + ' ' + query_text
+        else:
+            return query_text
+
+    def parse_and_remove_comments(self, string):
+        query = string
+        metadata = {}
+        while True:
+            comment_index = query.find('*/')
+            if comment_index < 0:
+                break
+            comment = query[:comment_index+2]
+            query = query[comment_index+2:]
+
+            for item in parse_comment(comment):
+                if ':' in item:
+                    key, value = item.split(':', 1)
+                    metadata[key.strip()] = value.strip()
+
+        return metadata, query.strip().rstrip(';')
+
+    def build_params(self, metadata={}):
+        params = {'token': self.configuration['api_key']}
+        if 'Limit' in metadata:
+            params['default_limit'] = metadata['Limit']
+        return params
+
+    def _execute_query(self, user, query, metadata={}):
+        base_url = self.get_base_url()
+        params = self.build_params(metadata)
+
+        return execute_iql_query(base_url, user, params, query)
 
     def run_query(self, query, user):
-        base_url = self.get_base_url()
-        error = None
-        query = self.remove_comments(query)
-        logger.info("about to execute query (user='{}'): {}".format(user, query))
-        resp = requests.post(base_url, params={'token': self.configuration['api_key'], 'default_limit': 1000},
-                json={'query': query})
-        if not resp.ok:
-            return None, "Query failed (%d): %s" % (resp.status_code, resp.content)
+        metadata, query = self.parse_and_remove_comments(query)
 
-        data = resp.json()
-        fields = self.flatten_schema(data['schema']['children'])
+        data = self._execute_query(user, query, metadata)
+        fields = self.flatten_schema(data['schema'])
 
         rows = []
         for row in data['data']:
@@ -136,6 +181,25 @@ class IQL(BaseQueryRunner):
             )
 
         return json_dumps({'columns': columns, 'rows': rows}), None
+    
+    def get_schema(self, get_stats=False):
+        ecs = [x['name'] for x in self._execute_query('get_schema', '@`__system::ecs`')['data']]
 
+        base_url = self.get_base_url()
+        params = self.build_params()
+
+        def task(query):
+            return execute_iql_query(base_url, 'get_schema', params, query)
+
+        ret = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_ec = {executor.submit(task, '@`' + ec + '` limit:0'): ec for ec in ecs}
+            for future in concurrent.futures.as_completed(future_to_ec):
+                ec = future_to_ec[future]
+                data = future.result()
+                fields = self.flatten_schema(data['schema'])
+                ret.append({'name': ec, 'columns': [f.name for f in fields]})
+        logger.info("returning: %s", len(json_dumps(ret)))
+        return ret
 
 register(IQL)
