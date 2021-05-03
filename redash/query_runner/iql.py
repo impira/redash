@@ -52,6 +52,28 @@ class Field(object):
     def type(self):
         return TYPES_MAP[self.iql_type]
 
+def unnest_pivot(rows, schema):
+    first_dim = [f for f in schema['children'] if f.get('intentV2') == 'DIMENSION']
+    if not first_dim:
+        return rows, schema
+    first_dim = first_dim[0]
+
+    next_dim = [f for f in schema['children'] if f.get('intentV2') is None and f.get('fieldType') == 'ENTITY']
+    if not next_dim:
+        return rows, schema
+    next_dim = next_dim[0]
+    assert next_dim['multiplicity'] == 'ONE_TO_MANY'
+
+    unnested_rows = []
+    for row in rows:
+        unnested = row[next_dim['name']]
+        for urow in unnested:
+            urow[first_dim['name']] = row[first_dim['name']]
+        unnested_rows.extend(unnested)
+
+    next_dim['children'] = [first_dim] + next_dim['children']
+    return unnest_pivot(unnested_rows, next_dim)
+
 def parse_comment(comment_string):
     return [x.strip() for x in comment_string.strip().lstrip('/*').rstrip('*/').split(',')]
 
@@ -60,7 +82,7 @@ def execute_iql_query(base_url, user, params, query):
 
     resp = requests.post(base_url, params=params, json={'query': query})
     if not resp.ok:
-        return None, "Query failed (%d): %s" % (resp.status_code, resp.content)
+        raise Exception("Query failed (%d): %s" % (resp.status_code, resp.content))
 
     logger.info("finished executing query (user='{}', params={}): {}".format(user, json_dumps(params), query))
 
@@ -165,10 +187,17 @@ class IQL(BaseQueryRunner):
         metadata, query = self.parse_and_remove_comments(query)
 
         data = self._execute_query(user, query, metadata)
-        fields = self.flatten_schema(data['schema'])
+
+        if data['errors']:
+            return None, data['errors'][0]
+
+        records, schema = data['data'], data['schema']
+        records, schema = unnest_pivot(records, schema)
+
+        fields = self.flatten_schema(schema)
 
         rows = []
-        for row in data['data']:
+        for row in records:
             flattened = {}
             for field in fields:
                 flattened[field.name] = field.retrieve(row)
