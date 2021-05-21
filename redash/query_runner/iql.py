@@ -53,10 +53,10 @@ class Field(object):
         return TYPES_MAP[self.iql_type]
 
 def unnest_pivot(rows, schema):
-    first_dim = [f for f in schema['children'] if f.get('intentV2') == 'DIMENSION']
-    if not first_dim:
+    logger.info("UNNEST: " + json_dumps(schema, indent=2))
+    flat_dims = [f for f in schema['children'] if f.get('intentV2') == 'DIMENSION']
+    if not flat_dims:
         return rows, schema
-    first_dim = first_dim[0]
 
     next_dim = [f for f in schema['children'] if f.get('intentV2') is None and f.get('fieldType') == 'ENTITY']
     if not next_dim:
@@ -68,10 +68,11 @@ def unnest_pivot(rows, schema):
     for row in rows:
         unnested = row[next_dim['name']]
         for urow in unnested:
-            urow[first_dim['name']] = row[first_dim['name']]
+            for dim in flat_dims:
+                urow[dim['name']] = row[dim['name']]
         unnested_rows.extend(unnested)
 
-    next_dim['children'] = [first_dim] + next_dim['children']
+    next_dim['children'] = flat_dims + next_dim['children']
     return unnest_pivot(unnested_rows, next_dim)
 
 def parse_comment(comment_string):
@@ -191,7 +192,7 @@ class IQL(BaseQueryRunner):
         if data['errors']:
             return None, data['errors'][0]
 
-        records, schema = data['data'], data['schema']
+        records, schema = data['data'] or [], data['schema']
         records, schema = unnest_pivot(records, schema)
 
         fields = self.flatten_schema(schema)
