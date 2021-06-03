@@ -101,7 +101,7 @@ export function getCounterData(rows: any, options: any, visualizationName: any) 
         // @ts-expect-error ts-migrate(2339) FIXME: Property 'showTrend' does not exist on type '{}'.
         result.showTrend = true;
         // @ts-expect-error ts-migrate(2339) FIXME: Property 'trendPositive' does not exist on type '{... Remove this comment to see the full error message
-        result.trendPositive = delta >= 0;
+        result.trendPositive = options.swapColors ? delta <= 0 : delta >= 0;
       }
     } else {
       // @ts-expect-error ts-migrate(2339) FIXME: Property 'targetValue' does not exist on type '{}'... Remove this comment to see the full error message
